@@ -1,0 +1,19 @@
+{
+  "name": "amoradb",
+  "version": "1.0.0",
+  "description": "A lightweight, file-based NoSQL database for Node.js applications with MongoDB-like query syntax and zero dependencies for core functionality.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samuelail/amoradb.git"
+  },
+  "author": "Samuel Ailemen",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/samuelail/amoradb/issues"
+  },
+  "homepage": "https://github.com/samuelail/amoradb#readme"
+}
