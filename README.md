@@ -378,10 +378,10 @@ const db = new AmoraDB('myapp', {
 ## 🗺️ Roadmap
 
 - [ ] TypeScript definitions (In Progress)
+- [ ] Bun Support
 - [ ] Multi-process support with file locking
 - [ ] Data compression
 - [ ] Encrypted storage
-- [ ] GraphQL adapter
 - [ ] Browser support (IndexedDB backend)
 - [ ] Replication and sync
 - [ ] Query optimization engine
