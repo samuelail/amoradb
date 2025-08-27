@@ -377,7 +377,7 @@ const db = new AmoraDB('myapp', {
 
 ## 🗺️ Roadmap
 
-- [ ] TypeScript definitions
+- [ ] TypeScript definitions (In Progress)
 - [ ] Multi-process support with file locking
 - [ ] Data compression
 - [ ] Encrypted storage
