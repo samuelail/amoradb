@@ -1,4 +1,6 @@
 const fs = require('fs').promises;
+const { createReadStream, createWriteStream } = require('fs');
+const { createInterface } = require('readline');
 const path = require('path');
 const { Query } = require('./Query');
 const { IndexManager } = require('./IndexManager');
@@ -11,30 +13,83 @@ class Table extends EventEmitter {
     super();
     this.name = name;
     this.db = db;
-    this.filePath = path.join(db.dbPath, `${name}.json`);
+    this.filePath = path.join(db.dbPath, `${name}.jsonl`);
+    this.metaPath = path.join(db.dbPath, `${name}.meta.json`);
     this.data = new Map();
     this.cache = new SimpleCache(db.options.cacheSize);
     this.indexManager = new IndexManager();
     this.writeQueue = Promise.resolve();
     this.isDirty = false;
     this.autoIncrement = 1;
+    this.isLoaded = false;
+    this.metadata = {
+      autoIncrement: 1,
+      indices: [],
+      recordCount: 0,
+      modified: null
+    };
   }
 
   async load() {
     try {
-      const content = await fs.readFile(this.filePath, 'utf-8');
-      const parsed = JSON.parse(content);
+      await this.loadMetadata();
       
-      if (parsed.data) {
-        for (const [id, record] of Object.entries(parsed.data)) {
-          this.data.set(id, record);
-        }
-        this.autoIncrement = parsed.autoIncrement || 1;
+      if (this.metadata.recordCount <= this.db.options.cacheSize) {
+        await this.loadAllRecords();
+      } else {
+        await this.buildIndicesFromFile();
       }
       
-      if (parsed.indices) {
-        for (const field of parsed.indices) {
-          this.indexManager.createIndex(field, this.data);
+      this.isLoaded = true;
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+      this.isLoaded = true;
+    }
+  }
+
+  async loadMetadata() {
+    try {
+      const content = await fs.readFile(this.metaPath, 'utf-8');
+      this.metadata = JSON.parse(content);
+      this.autoIncrement = this.metadata.autoIncrement || 1;
+      
+      for (const field of this.metadata.indices) {
+        this.indexManager.createIndex(field, new Map());
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
+
+  async saveMetadata() {
+    this.metadata.modified = new Date().toISOString();
+    this.metadata.autoIncrement = this.autoIncrement;
+    this.metadata.indices = Array.from(this.indexManager.indices.keys());
+    this.metadata.recordCount = this.data.size;
+    
+    await fs.writeFile(this.metaPath, JSON.stringify(this.metadata, null, 2));
+  }
+
+  async loadAllRecords() {
+    try {
+      const fileStream = createReadStream(this.filePath);
+      const rl = createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+
+      for await (const line of rl) {
+        if (line.trim()) {
+          try {
+            const record = JSON.parse(line);
+            this.data.set(record._id, record);
+            this.indexManager.updateIndices(record._id, record);
+          } catch (parseError) {
+          }
         }
       }
     } catch (error) {
@@ -44,24 +99,95 @@ class Table extends EventEmitter {
     }
   }
 
-  async save() {
-    const dataObj = {};
-    for (const [id, record] of this.data.entries()) {
-      dataObj[id] = record;
+  async buildIndicesFromFile() {
+    try {
+      const fileStream = createReadStream(this.filePath);
+      const rl = createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+
+      for await (const line of rl) {
+        if (line.trim()) {
+          try {
+            const record = JSON.parse(line);
+            this.indexManager.updateIndices(record._id, record);
+          } catch (parseError) {
+          }
+        }
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
     }
-    
-    const saveData = {
-      data: dataObj,
-      indices: Array.from(this.indexManager.indices.keys()),
-      autoIncrement: this.autoIncrement,
-      modified: new Date().toISOString()
-    };
-    
+  }
+
+  async loadRecordById(id) {
+    if (this.data.has(id)) {
+      return this.data.get(id);
+    }
+
+    try {
+      const fileStream = createReadStream(this.filePath);
+      const rl = createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+
+      for await (const line of rl) {
+        if (line.trim()) {
+          try {
+            const record = JSON.parse(line);
+            if (record._id === id) {
+              this.cache.set(id, record);
+              return record;
+            }
+          } catch (parseError) {
+            continue;
+          }
+        }
+      }
+    } catch (error) {
+    }
+
+    return null;
+  }
+
+  async save() {
     const tempPath = `${this.filePath}.tmp`;
-    await fs.writeFile(tempPath, JSON.stringify(saveData, null, 2));
-    await fs.rename(tempPath, this.filePath);
-    this.isDirty = false;
-    this.emit('save', this.name);
+    const writeStream = createWriteStream(tempPath);
+    
+    try {
+      for (const record of this.data.values()) {
+        writeStream.write(JSON.stringify(record) + '\n');
+      }
+      
+      await new Promise((resolve, reject) => {
+        writeStream.end((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+      
+      await fs.rename(tempPath, this.filePath);
+      await this.saveMetadata();
+      
+      this.isDirty = false;
+      this.emit('save', this.name);
+    } catch (error) {
+      await fs.unlink(tempPath).catch(() => {});
+      throw error;
+    }
+  }
+
+  async appendRecord(record) {
+    try {
+      const line = JSON.stringify(record) + '\n';
+      await fs.appendFile(this.filePath, line);
+    } catch (error) {
+      this.queueSave();
+    }
   }
 
   queueSave() {
@@ -84,34 +210,60 @@ class Table extends EventEmitter {
     this.data.set(id, fullRecord);
     this.cache.set(id, fullRecord);
     this.indexManager.updateIndices(id, fullRecord);
-    this.queueSave();
-    this.emit('insert', fullRecord);
     
+    this.appendRecord(fullRecord).catch(() => {
+      this.queueSave();
+    });
+    
+    this.emit('insert', fullRecord);
     return fullRecord;
   }
 
   insertMany(records) {
     const inserted = [];
     for (const record of records) {
-      inserted.push(this.insert(record));
+      const id = record.id || record._id || uuidv4();
+      const timestamp = new Date().toISOString();
+      
+      const fullRecord = {
+        ...record,
+        _id: id,
+        _created: timestamp,
+        _modified: timestamp
+      };
+      
+      this.data.set(id, fullRecord);
+      this.cache.set(id, fullRecord);
+      this.indexManager.updateIndices(id, fullRecord);
+      inserted.push(fullRecord);
     }
+    
+    this.queueSave();
+    
+    for (const record of inserted) {
+      this.emit('insert', record);
+    }
+    
     return inserted;
   }
 
-  get(id) {
+  async get(id) {
     if (this.cache.has(id)) {
       return this.cache.get(id);
     }
     
-    const record = this.data.get(id);
-    if (record) {
+    if (this.data.has(id)) {
+      const record = this.data.get(id);
       this.cache.set(id, record);
+      return record;
     }
+    
+    const record = await this.loadRecordById(id);
     return record;
   }
 
-  update(id, updates) {
-    const record = this.get(id);
+  async update(id, updates) {
+    let record = await this.get(id);
     if (!record) return null;
     
     const updated = {
@@ -131,20 +283,22 @@ class Table extends EventEmitter {
     return updated;
   }
 
-  updateMany(condition, updates) {
+  async updateMany(condition, updates) {
     const query = new Query(this.data, this.indexManager);
-    const records = query.where(condition).execute();
+    query.table = this;
+    const records = await query.where(condition).execute();
     const updated = [];
     
     for (const record of records) {
-      updated.push(this.update(record._id, updates));
+      const result = await this.update(record._id, updates);
+      if (result) updated.push(result);
     }
     
     return updated;
   }
 
-  delete(id) {
-    const record = this.get(id);
+  async delete(id) {
+    const record = await this.get(id);
     if (!record) return false;
     
     this.data.delete(id);
@@ -156,13 +310,14 @@ class Table extends EventEmitter {
     return true;
   }
 
-  deleteMany(condition) {
+  async deleteMany(condition) {
     const query = new Query(this.data, this.indexManager);
-    const records = query.where(condition).execute();
+    query.table = this;
+    const records = await query.where(condition).execute();
     const deleted = [];
     
     for (const record of records) {
-      if (this.delete(record._id)) {
+      if (await this.delete(record._id)) {
         deleted.push(record);
       }
     }
@@ -171,30 +326,44 @@ class Table extends EventEmitter {
   }
 
   find(condition) {
-    return new Query(this.data, this.indexManager).where(condition);
+    const query = new Query(this.data, this.indexManager);
+    query.table = this;
+    return query.where(condition);
   }
 
-  findOne(condition) {
-    return new Query(this.data, this.indexManager).where(condition).first();
+  async findOne(condition) {
+    const query = new Query(this.data, this.indexManager);
+    query.table = this;
+    return await query.where(condition).first();
   }
 
-  findById(id) {
-    return this.get(id);
+  async findById(id) {
+    return await this.get(id);
   }
 
   all() {
-    return new Query(this.data, this.indexManager);
+    const query = new Query(this.data, this.indexManager);
+    query.table = this;
+    return query;
   }
 
-  count(condition) {
+  async count(condition) {
     if (!condition) {
-      return this.data.size;
+      if (this.data.size === this.metadata.recordCount || this.metadata.recordCount === 0) {
+        return this.data.size;
+      }
+      return this.metadata.recordCount;
     }
-    return new Query(this.data, this.indexManager).where(condition).count();
+    const query = new Query(this.data, this.indexManager);
+    query.table = this;
+    return await query.where(condition).count();
   }
 
   createIndex(field) {
     this.indexManager.createIndex(field, this.data);
+    if (this.data.size < this.metadata.recordCount) {
+      this.buildIndicesFromFile();
+    }
     this.queueSave();
     return this;
   }
@@ -211,6 +380,7 @@ class Table extends EventEmitter {
 
   async drop() {
     await fs.unlink(this.filePath).catch(() => {});
+    await fs.unlink(this.metaPath).catch(() => {});
     this.data.clear();
     this.cache.clear();
     this.emit('drop');
@@ -220,7 +390,9 @@ class Table extends EventEmitter {
     this.data.clear();
     this.cache.clear();
     this.indexManager.clear();
-    this.queueSave();
+    this.metadata.recordCount = 0;
+    await fs.unlink(this.filePath).catch(() => {});
+    await this.saveMetadata();
     this.emit('truncate');
   }
 }

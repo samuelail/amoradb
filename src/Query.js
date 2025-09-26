@@ -1,3 +1,6 @@
+const { createReadStream } = require('fs');
+const { createInterface } = require('readline');
+
 class Query {
   constructor(data, indexManager) {
     this.data = data;
@@ -8,6 +11,7 @@ class Query {
     this.limitCount = null;
     this.skipCount = 0;
     this.selectedFields = null;
+    this.table = null;
   }
 
   where(condition) {
@@ -91,24 +95,19 @@ class Query {
     return this;
   }
 
-  execute() {
+  async execute() {
     let results = [];
     
-    // Use index if available for first condition
-    if (this.conditions.length > 0 && this.indexManager) {
-      const firstCond = this.conditions[0];
-      // Try to optimize with index (simplified example)
-      results = Array.from(this.data.values());
+    if (this.table && (this.table.data.size < this.table.metadata.recordCount)) {
+      results = await this.streamResults();
     } else {
       results = Array.from(this.data.values());
     }
     
-    // Apply conditions
     for (const condition of this.conditions) {
       results = results.filter(condition);
     }
     
-    // Apply sorting
     if (this.sortField) {
       results.sort((a, b) => {
         const aVal = a[this.sortField];
@@ -121,7 +120,6 @@ class Query {
       });
     }
     
-    // Apply skip and limit
     if (this.skipCount > 0) {
       results = results.slice(this.skipCount);
     }
@@ -130,7 +128,6 @@ class Query {
       results = results.slice(0, this.limitCount);
     }
     
-    // Apply field selection
     if (this.selectedFields) {
       results = results.map(record => {
         const selected = {};
@@ -146,25 +143,53 @@ class Query {
     return results;
   }
 
-  first() {
+  async streamResults() {
+    const results = [];
+    try {
+      const fileStream = createReadStream(this.table.filePath);
+      const rl = createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+
+      for await (const line of rl) {
+        if (line.trim()) {
+          try {
+            const record = JSON.parse(line);
+            results.push(record);
+          } catch (parseError) {
+            continue;
+          }
+        }
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    
+    return results;
+  }
+
+  async first() {
     this.limitCount = 1;
-    const results = this.execute();
+    const results = await this.execute();
     return results.length > 0 ? results[0] : null;
   }
 
-  count() {
-    const results = this.execute();
+  async count() {
+    const results = await this.execute();
     return results.length;
   }
 
-  distinct(field) {
-    const results = this.execute();
+  async distinct(field) {
+    const results = await this.execute();
     const values = new Set(results.map(r => r[field]));
     return Array.from(values);
   }
 
-  aggregate(operations) {
-    const results = this.execute();
+  async aggregate(operations) {
+    const results = await this.execute();
     const aggregated = {};
     
     for (const [key, operation] of Object.entries(operations)) {
