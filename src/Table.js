@@ -15,6 +15,7 @@ class Table extends EventEmitter {
     this.db = db;
     this.filePath = path.join(db.dbPath, `${name}.jsonl`);
     this.metaPath = path.join(db.dbPath, `${name}.meta.json`);
+    this.tempPath = path.join(db.dbPath, `${name}.jsonl.tmp`);
     this.data = new Map();
     this.cache = new SimpleCache(db.options.cacheSize);
     this.indexManager = new IndexManager();
@@ -22,12 +23,20 @@ class Table extends EventEmitter {
     this.isDirty = false;
     this.autoIncrement = 1;
     this.isLoaded = false;
+    this.pendingWrites = [];
+    this.pendingUpdates = new Map();
+    this.pendingDeletes = new Set();
+    this.batchSize = 1000;
+    this.deletedIds = new Set();
     this.metadata = {
       autoIncrement: 1,
       indices: [],
       recordCount: 0,
       modified: null
     };
+    this.compactionThreshold = 0.3;
+    this.lastCompaction = Date.now();
+    this.compactionInterval = 60000;
   }
 
   async load() {
@@ -86,8 +95,10 @@ class Table extends EventEmitter {
         if (line.trim()) {
           try {
             const record = JSON.parse(line);
-            this.data.set(record._id, record);
-            this.indexManager.updateIndices(record._id, record);
+            if (!this.deletedIds.has(record._id)) {
+              this.data.set(record._id, record);
+              this.indexManager.updateIndices(record._id, null, record);
+            }
           } catch (parseError) {
           }
         }
@@ -111,7 +122,9 @@ class Table extends EventEmitter {
         if (line.trim()) {
           try {
             const record = JSON.parse(line);
-            this.indexManager.updateIndices(record._id, record);
+            if (!this.deletedIds.has(record._id)) {
+              this.indexManager.updateIndices(record._id, null, record);
+            }
           } catch (parseError) {
           }
         }
@@ -124,8 +137,18 @@ class Table extends EventEmitter {
   }
 
   async loadRecordById(id) {
+    if (this.deletedIds.has(id) || this.pendingDeletes.has(id)) return null;
+    
+    if (this.pendingUpdates.has(id)) {
+      return this.pendingUpdates.get(id);
+    }
+    
     if (this.data.has(id)) {
       return this.data.get(id);
+    }
+
+    if (this.cache.has(id)) {
+      return this.cache.get(id);
     }
 
     try {
@@ -139,8 +162,10 @@ class Table extends EventEmitter {
         if (line.trim()) {
           try {
             const record = JSON.parse(line);
-            if (record._id === id) {
+            if (record._id === id && !this.deletedIds.has(id)) {
               this.cache.set(id, record);
+              rl.close();
+              fileStream.destroy();
               return record;
             }
           } catch (parseError) {
@@ -154,13 +179,61 @@ class Table extends EventEmitter {
     return null;
   }
 
+  needsCompaction() {
+    const totalOps = this.pendingUpdates.size + this.pendingDeletes.size + this.deletedIds.size;
+    const timeSinceCompaction = Date.now() - this.lastCompaction;
+    
+    return (totalOps > this.metadata.recordCount * this.compactionThreshold) ||
+           (totalOps > 10000 && timeSinceCompaction > this.compactionInterval);
+  }
+
   async save() {
-    const tempPath = `${this.filePath}.tmp`;
-    const writeStream = createWriteStream(tempPath);
+    await this.flushPendingWrites();
+    
+    if (!this.needsCompaction() && this.pendingUpdates.size === 0 && this.pendingDeletes.size === 0) {
+      return;
+    }
+    
+    const writeStream = createWriteStream(this.tempPath);
     
     try {
-      for (const record of this.data.values()) {
-        writeStream.write(JSON.stringify(record) + '\n');
+      const processedIds = new Set();
+      
+      if (await fs.stat(this.filePath).catch(() => null)) {
+        const fileStream = createReadStream(this.filePath);
+        const rl = createInterface({
+          input: fileStream,
+          crlfDelay: Infinity
+        });
+
+        for await (const line of rl) {
+          if (line.trim()) {
+            try {
+              const record = JSON.parse(line);
+              const id = record._id;
+              
+              if (!processedIds.has(id)) {
+                processedIds.add(id);
+                
+                if (this.pendingDeletes.has(id) || this.deletedIds.has(id)) {
+                  continue;
+                }
+                
+                const updatedRecord = this.pendingUpdates.get(id) || record;
+                writeStream.write(JSON.stringify(updatedRecord) + '\n');
+              }
+            } catch (parseError) {
+              continue;
+            }
+          }
+        }
+      }
+      
+      for (const [id, record] of this.data.entries()) {
+        if (!processedIds.has(id) && !this.pendingDeletes.has(id) && !this.deletedIds.has(id)) {
+          const updatedRecord = this.pendingUpdates.get(id) || record;
+          writeStream.write(JSON.stringify(updatedRecord) + '\n');
+        }
       }
       
       await new Promise((resolve, reject) => {
@@ -170,21 +243,42 @@ class Table extends EventEmitter {
         });
       });
       
-      await fs.rename(tempPath, this.filePath);
+      await fs.rename(this.tempPath, this.filePath);
+      
+      for (const [id, record] of this.pendingUpdates) {
+        this.data.set(id, record);
+      }
+      for (const id of this.pendingDeletes) {
+        this.data.delete(id);
+      }
+      
+      this.pendingUpdates.clear();
+      this.pendingDeletes.clear();
+      this.deletedIds.clear();
+      this.lastCompaction = Date.now();
+      
       await this.saveMetadata();
       
       this.isDirty = false;
       this.emit('save', this.name);
     } catch (error) {
-      await fs.unlink(tempPath).catch(() => {});
+      await fs.unlink(this.tempPath).catch(() => {});
       throw error;
     }
   }
 
-  async appendRecord(record) {
+  async flushPendingWrites() {
+    if (this.pendingWrites.length === 0) return;
+    
     try {
-      const line = JSON.stringify(record) + '\n';
-      await fs.appendFile(this.filePath, line);
+      const lines = this.pendingWrites.map(record => JSON.stringify(record) + '\n');
+      await fs.appendFile(this.filePath, lines.join(''));
+      
+      for (const record of this.pendingWrites) {
+        this.data.set(record._id, record);
+      }
+      
+      this.pendingWrites = [];
     } catch (error) {
       this.queueSave();
     }
@@ -193,7 +287,11 @@ class Table extends EventEmitter {
   queueSave() {
     if (!this.db.options.autoSave) return;
     this.isDirty = true;
-    this.writeQueue = this.writeQueue.then(() => this.save());
+    
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      this.writeQueue = this.writeQueue.then(() => this.save());
+    }, 100);
   }
 
   insert(record) {
@@ -207,13 +305,16 @@ class Table extends EventEmitter {
       _modified: timestamp
     };
     
-    this.data.set(id, fullRecord);
     this.cache.set(id, fullRecord);
-    this.indexManager.updateIndices(id, fullRecord);
+    this.indexManager.updateIndices(id, null, fullRecord);
+    this.deletedIds.delete(id);
+    this.pendingDeletes.delete(id);
     
-    this.appendRecord(fullRecord).catch(() => {
-      this.queueSave();
-    });
+    this.pendingWrites.push(fullRecord);
+    
+    if (this.pendingWrites.length >= this.batchSize) {
+      this.flushPendingWrites().catch(() => this.queueSave());
+    }
     
     this.emit('insert', fullRecord);
     return fullRecord;
@@ -221,9 +322,10 @@ class Table extends EventEmitter {
 
   insertMany(records) {
     const inserted = [];
+    const timestamp = new Date().toISOString();
+    
     for (const record of records) {
       const id = record.id || record._id || uuidv4();
-      const timestamp = new Date().toISOString();
       
       const fullRecord = {
         ...record,
@@ -232,13 +334,17 @@ class Table extends EventEmitter {
         _modified: timestamp
       };
       
-      this.data.set(id, fullRecord);
       this.cache.set(id, fullRecord);
-      this.indexManager.updateIndices(id, fullRecord);
+      this.indexManager.updateIndices(id, null, fullRecord);
+      this.deletedIds.delete(id);
+      this.pendingDeletes.delete(id);
       inserted.push(fullRecord);
+      this.pendingWrites.push(fullRecord);
     }
     
-    this.queueSave();
+    if (this.pendingWrites.length >= this.batchSize) {
+      this.flushPendingWrites().catch(() => this.queueSave());
+    }
     
     for (const record of inserted) {
       this.emit('insert', record);
@@ -248,6 +354,12 @@ class Table extends EventEmitter {
   }
 
   async get(id) {
+    if (this.deletedIds.has(id) || this.pendingDeletes.has(id)) return null;
+    
+    if (this.pendingUpdates.has(id)) {
+      return this.pendingUpdates.get(id);
+    }
+    
     if (this.cache.has(id)) {
       return this.cache.get(id);
     }
@@ -266,6 +378,8 @@ class Table extends EventEmitter {
     let record = await this.get(id);
     if (!record) return null;
     
+    const oldRecord = this.data.get(id) || record;
+    
     const updated = {
       ...record,
       ...updates,
@@ -274,9 +388,9 @@ class Table extends EventEmitter {
       _modified: new Date().toISOString()
     };
     
-    this.data.set(id, updated);
+    this.pendingUpdates.set(id, updated);
     this.cache.set(id, updated);
-    this.indexManager.updateIndices(id, updated);
+    this.indexManager.updateIndices(id, oldRecord, updated);
     this.queueSave();
     this.emit('update', updated);
     
@@ -289,9 +403,28 @@ class Table extends EventEmitter {
     const records = await query.where(condition).execute();
     const updated = [];
     
+    const timestamp = new Date().toISOString();
+    
     for (const record of records) {
-      const result = await this.update(record._id, updates);
-      if (result) updated.push(result);
+      const oldRecord = this.data.get(record._id) || record;
+      
+      const updatedRecord = {
+        ...record,
+        ...updates,
+        _id: record._id,
+        _created: record._created,
+        _modified: timestamp
+      };
+      
+      this.pendingUpdates.set(record._id, updatedRecord);
+      this.cache.set(record._id, updatedRecord);
+      this.indexManager.updateIndices(record._id, oldRecord, updatedRecord);
+      updated.push(updatedRecord);
+      this.emit('update', updatedRecord);
+    }
+    
+    if (updated.length > 0) {
+      this.queueSave();
     }
     
     return updated;
@@ -301,12 +434,13 @@ class Table extends EventEmitter {
     const record = await this.get(id);
     if (!record) return false;
     
-    this.data.delete(id);
     this.cache.delete(id);
-    this.indexManager.removeFromIndices(id);
-    this.queueSave();
-    this.emit('delete', record);
+    this.indexManager.removeFromIndices(id, record);
+    this.pendingDeletes.add(id);
     
+    this.queueSave();
+    
+    this.emit('delete', record);
     return true;
   }
 
@@ -317,9 +451,15 @@ class Table extends EventEmitter {
     const deleted = [];
     
     for (const record of records) {
-      if (await this.delete(record._id)) {
-        deleted.push(record);
-      }
+      this.cache.delete(record._id);
+      this.indexManager.removeFromIndices(record._id, record);
+      this.pendingDeletes.add(record._id);
+      deleted.push(record);
+      this.emit('delete', record);
+    }
+    
+    if (deleted.length > 0) {
+      this.queueSave();
     }
     
     return deleted;
@@ -349,10 +489,11 @@ class Table extends EventEmitter {
 
   async count(condition) {
     if (!condition) {
+      const deletedCount = this.deletedIds.size + this.pendingDeletes.size;
       if (this.data.size === this.metadata.recordCount || this.metadata.recordCount === 0) {
-        return this.data.size;
+        return this.data.size + this.pendingWrites.length - deletedCount;
       }
-      return this.metadata.recordCount;
+      return Math.max(0, this.metadata.recordCount + this.pendingWrites.length - deletedCount);
     }
     const query = new Query(this.data, this.indexManager);
     query.table = this;
@@ -375,21 +516,33 @@ class Table extends EventEmitter {
   }
 
   async flush() {
+    await this.flushPendingWrites();
     await this.writeQueue;
   }
 
   async drop() {
+    clearTimeout(this.saveTimer);
     await fs.unlink(this.filePath).catch(() => {});
     await fs.unlink(this.metaPath).catch(() => {});
+    await fs.unlink(this.tempPath).catch(() => {});
     this.data.clear();
     this.cache.clear();
+    this.deletedIds.clear();
+    this.pendingWrites = [];
+    this.pendingUpdates.clear();
+    this.pendingDeletes.clear();
     this.emit('drop');
   }
 
   async truncate() {
+    clearTimeout(this.saveTimer);
     this.data.clear();
     this.cache.clear();
     this.indexManager.clear();
+    this.deletedIds.clear();
+    this.pendingWrites = [];
+    this.pendingUpdates.clear();
+    this.pendingDeletes.clear();
     this.metadata.recordCount = 0;
     await fs.unlink(this.filePath).catch(() => {});
     await this.saveMetadata();
