@@ -1,6 +1,6 @@
 {
   "name": "amoradb",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A lightweight, file-based NoSQL database for Node.js applications with MongoDB-like query syntax and zero dependencies for core functionality.",
   "main": "index.js",
   "scripts": {
