@@ -62,14 +62,14 @@ const user = users.insert({
 });
 
 // Query with operators
-const results = users
+const results = await users
   .find({ age: { $gte: 18 } })
   .sort('name', 'asc')
   .limit(10)
   .execute();
 
 // Update records
-users.update(user._id, { status: 'active' });
+await users.update(user._id, { status: 'active' });
 
 // Close when done
 await db.close();
@@ -82,9 +82,9 @@ await db.close();
 data/
 └── myapp/                    # Database directory
     ├── _metadata.json        # Database metadata
-    ├── users.json           # Users table
-    ├── orders.json          # Orders table
-    └── products.json        # Products table
+    ├── users.jsonl           # Users table
+    ├── orders.jsonl          # Orders table
+    └── products.jsonl        # Products table
 ```
 
 ### Tables (Collections)
@@ -119,10 +119,10 @@ users.all().execute();
 users.find({ status: 'active' }).execute();
 
 // Find one
-users.findOne({ email: 'user@example.com' });
+await users.findOne({ email: 'user@example.com' });
 
 // Find by ID
-users.findById('uuid-here');
+await users.findById('uuid-here');
 ```
 
 ### Query Operators
@@ -144,7 +144,7 @@ users.findById('uuid-here');
 
 ```javascript
 // Chained conditions
-const premiumUsers = users
+const premiumUsers = await users
   .find({ age: { $gte: 18 } })
   .and({ subscription: 'premium' })
   .or({ role: 'vip' })
@@ -154,7 +154,7 @@ const premiumUsers = users
   .execute();
 
 // Select specific fields
-const emails = users
+const emails = await users
   .find({ newsletter: true })
   .select(['email', 'name'])
   .execute();
@@ -166,7 +166,7 @@ const uniqueCities = users.all().distinct('address.city');
 ## 📊 Aggregation
 
 ```javascript
-const stats = users
+const stats = await users
   .find({ active: true })
   .aggregate({
     totalUsers: { $count: true },
@@ -335,7 +335,7 @@ logs.insert({
 });
 
 // Query recent activities
-const recentLogs = logs
+const recentLogs = await logs
   .find({ 
     timestamp: { $gte: Date.now() - 86400000 } // Last 24h
   })
@@ -358,13 +358,30 @@ const db = new AmoraDB('myapp', {
 
 ## 🚀 Performance Benchmarks
 
-| Operation | Records | Time | Ops/sec |
-|-----------|---------|------|---------|
-| Insert | 10,000 | ~2s | 5,000 |
-| Find (indexed) | 10,000 | ~5ms | 2,000,000 |
-| Find (non-indexed) | 10,000 | ~50ms | 200,000 |
-| Update | 1,000 | ~200ms | 5,000 |
-| Delete | 1,000 | ~150ms | 6,666 |
+=== PERFORMANCE BENCHMARK RESULTS ===
+
+| Operation | Records | Time (ms) | Ops/sec | Memory (MB) |
+|-----------|---------|-----------|---------|-------------|
+| Single Insert (1,000 records) |   1,000 |        16 |    62,663 |        3.84 |
+| Batch Insert (100,000 records) | 100,000 |     1,672 |    59,801 |      378.46 |
+| Simple Indexed Query (category) |  10,001 |         4 | 2,360,443 |        1.68 |
+| Complex Indexed Query (price range) |  10,057 |        11 |   900,926 |        8.93 |
+| Non-indexed Query (name pattern) |  11,111 |        36 |   312,514 |       -2.88 |
+| Sorted Query with Limit (top 1000 by price) |   1,000 |        13 |    76,240 |       -11.2 |
+| Aggregation (price statistics) |       1 |        22 |        45 |        6.68 |
+| Count Query (all active products) |  25,001 |         2 | 11,957,429 |        3.36 |
+| Distinct Query (unique categories) |      10 |        27 |       371 |       -2.41 |
+| Single Updates (10,000 records) |  10,000 |     1,387 |     7,208 |        2.02 |
+| Batch Update (50,000 records) |  10,001 |     1,222 |     8,185 |        3.71 |
+| Single Deletes (5,000 records) |   5,000 |       318 |    15,705 |       -0.33 |
+| Batch Delete (remaining archived) |  20,000 |     1,044 |    19,159 |       -0.86 |
+| Memory Efficient Insert (50,000 records, small cache) |  50,000 |       518 |    96,577 |     -151.46 |
+| Streaming Query (large dataset) |     100 |        22 |     4,579 |        3.08 |
+
+=== SUMMARY ===
+Total Records Processed: 253,282
+Total Time: 6.31s
+Average Performance: 40,114 ops/sec
 
 *Benchmarks on MacBook Pro M1, Node.js 18*
 
@@ -378,6 +395,7 @@ const db = new AmoraDB('myapp', {
 ## 🗺️ Roadmap
 
 - [ ] TypeScript definitions (In Progress)
+- [x] Better Memory Optimization
 - [ ] Bun Support
 - [ ] Multi-process support with file locking
 - [ ] Data compression
