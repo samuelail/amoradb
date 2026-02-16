@@ -67,6 +67,15 @@ class AmoraDB extends EventEmitter {
   async saveMetadata() {
     const metaPath = path.join(this.dbPath, '_metadata.json');
     this.metadata.modified = new Date().toISOString();
+
+    // Sync index info from each table into database-level metadata
+    for (const [name, table] of this.tables.entries()) {
+      if (this.metadata.tables[name]) {
+        this.metadata.tables[name].indices = table.indexManager.getIndices();
+        this.metadata.tables[name].modified = new Date().toISOString();
+      }
+    }
+
     await fs.writeFile(metaPath, JSON.stringify(this.metadata, null, 2));
   }
 
@@ -205,6 +214,7 @@ class AmoraDB extends EventEmitter {
         await table.save();
       }
     }
+    await this.saveMetadata();
     this.emit('close');
   }
 

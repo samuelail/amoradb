@@ -17,6 +17,12 @@ class Query {
   }
 
   where(condition) {
+    // Snapshot lengths so or() can undo what this where() added
+    this._lastWhereSnapshot = {
+      nonIndexableLen: this.nonIndexableConditions.length,
+      indexableLen: this.indexableConditions.length
+    };
+
     if (typeof condition === 'function') {
       this.conditions.push(condition);
       this.nonIndexableConditions.push(condition);
@@ -60,16 +66,12 @@ class Query {
   or(condition) {
     const prevCondition = this.conditions.pop();
     if (prevCondition) {
-      // Remove the previous condition from indexable/nonIndexable arrays
-      // since it's being replaced by the combined OR condition
-      const idxInNonIndexable = this.nonIndexableConditions.indexOf(prevCondition);
-      if (idxInNonIndexable >= 0) {
-        this.nonIndexableConditions.splice(idxInNonIndexable, 1);
+      // Rollback what the previous where() added to indexable/nonIndexable
+      if (this._lastWhereSnapshot) {
+        this.nonIndexableConditions.length = this._lastWhereSnapshot.nonIndexableLen;
+        this.indexableConditions.length = this._lastWhereSnapshot.indexableLen;
+        this._lastWhereSnapshot = null;
       }
-
-      // OR conditions can't use indices — clear any indexable conditions
-      // from the previous where() call that we're now OR-ing
-      this.indexableConditions = [];
 
       const condFn = typeof condition === 'object' ?
         this.buildCondition(condition) : condition;
