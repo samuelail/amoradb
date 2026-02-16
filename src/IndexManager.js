@@ -173,19 +173,28 @@ class IndexManager {
   findByIndex(field, value) {
     const index = this.indices.get(field);
     if (!index) return null;
-    
+
     if (index.type === 'sorted') {
       const results = new Set();
-      for (const item of index.values) {
-        if (item.value === value) {
-          results.add(item.id);
-        } else if (item.value > value) {
-          break;
+      const arr = index.values;
+      // Binary search to find the first element with the target value
+      let left = 0;
+      let right = arr.length;
+      while (left < right) {
+        const mid = Math.floor((left + right) / 2);
+        if (arr[mid].value < value) {
+          left = mid + 1;
+        } else {
+          right = mid;
         }
+      }
+      // Scan forward through all matching values
+      for (let i = left; i < arr.length && arr[i].value === value; i++) {
+        results.add(arr[i].id);
       }
       return results;
     }
-    
+
     return index.get(value) || new Set();
   }
 

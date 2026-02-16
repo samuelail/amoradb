@@ -95,32 +95,40 @@ class AmoraDB extends EventEmitter {
           let autoIncrement = 1;
           const indices = [];
           
-          if (parsed.data) {
+          if (parsed.data && Object.keys(parsed.data).length > 0) {
             const jsonlLines = [];
             for (const [id, record] of Object.entries(parsed.data)) {
               jsonlLines.push(JSON.stringify(record));
               recordCount++;
             }
-            
+
             if (jsonlLines.length > 0) {
               await fs.writeFile(jsonlPath, jsonlLines.join('\n') + '\n');
             }
-            
+
             autoIncrement = parsed.autoIncrement || 1;
             if (parsed.indices) {
               indices.push(...parsed.indices);
             }
+          } else {
+            // Skip migration if there's no data to migrate
+            continue;
           }
-          
+
           const metadata = {
             autoIncrement,
             indices,
             recordCount,
             modified: parsed.modified || new Date().toISOString()
           };
-          
+
           await fs.writeFile(metaPath, JSON.stringify(metadata, null, 2));
-          await fs.unlink(jsonPath);
+
+          // Verify the migrated file was written before deleting the original
+          const writtenStat = await fs.stat(jsonlPath).catch(() => null);
+          if (writtenStat && writtenStat.size > 0) {
+            await fs.unlink(jsonPath);
+          }
           
         } catch (migrationError) {
         }
@@ -159,9 +167,10 @@ class AmoraDB extends EventEmitter {
     if (!this.initialized) {
       throw new Error('Database not initialized. Call init() first.');
     }
-    
+
     if (!this.tables.has(name)) {
       const table = new Table(name, this);
+      table.load().catch((err) => this.emit('error', err));
       this.tables.set(name, table);
       this.metadata.tables[name] = {
         created: new Date().toISOString(),
@@ -169,9 +178,9 @@ class AmoraDB extends EventEmitter {
         indices: [],
         schema: {}
       };
-      this.saveMetadata();
+      this.saveMetadata().catch((err) => this.emit('error', err));
     }
-    
+
     return this.tables.get(name);
   }
 
@@ -192,6 +201,9 @@ class AmoraDB extends EventEmitter {
   async close() {
     for (const table of this.tables.values()) {
       await table.flush();
+      if (table.pendingUpdates.size > 0 || table.pendingDeletes.size > 0) {
+        await table.save();
+      }
     }
     this.emit('close');
   }

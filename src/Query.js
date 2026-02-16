@@ -60,10 +60,21 @@ class Query {
   or(condition) {
     const prevCondition = this.conditions.pop();
     if (prevCondition) {
+      // Remove the previous condition from indexable/nonIndexable arrays
+      // since it's being replaced by the combined OR condition
+      const idxInNonIndexable = this.nonIndexableConditions.indexOf(prevCondition);
+      if (idxInNonIndexable >= 0) {
+        this.nonIndexableConditions.splice(idxInNonIndexable, 1);
+      }
+
+      // OR conditions can't use indices — clear any indexable conditions
+      // from the previous where() call that we're now OR-ing
+      this.indexableConditions = [];
+
+      const condFn = typeof condition === 'object' ?
+        this.buildCondition(condition) : condition;
       const orCondition = (record) => {
-        const cond = typeof condition === 'object' ? 
-          this.buildCondition(condition) : condition;
-        return prevCondition(record) || cond(record);
+        return prevCondition(record) || condFn(record);
       };
       this.conditions.push(orCondition);
       this.nonIndexableConditions.push(orCondition);
@@ -87,20 +98,20 @@ class Query {
   }
 
   evaluateOperator(fieldValue, operator) {
-    if (operator.$eq !== undefined) return fieldValue === operator.$eq;
-    if (operator.$ne !== undefined) return fieldValue !== operator.$ne;
-    if (operator.$gt !== undefined) return fieldValue > operator.$gt;
-    if (operator.$gte !== undefined) return fieldValue >= operator.$gte;
-    if (operator.$lt !== undefined) return fieldValue < operator.$lt;
-    if (operator.$lte !== undefined) return fieldValue <= operator.$lte;
-    if (operator.$in !== undefined) return operator.$in.includes(fieldValue);
-    if (operator.$nin !== undefined) return !operator.$nin.includes(fieldValue);
+    if (operator.$eq !== undefined && fieldValue !== operator.$eq) return false;
+    if (operator.$ne !== undefined && fieldValue === operator.$ne) return false;
+    if (operator.$gt !== undefined && !(fieldValue > operator.$gt)) return false;
+    if (operator.$gte !== undefined && !(fieldValue >= operator.$gte)) return false;
+    if (operator.$lt !== undefined && !(fieldValue < operator.$lt)) return false;
+    if (operator.$lte !== undefined && !(fieldValue <= operator.$lte)) return false;
+    if (operator.$in !== undefined && !operator.$in.includes(fieldValue)) return false;
+    if (operator.$nin !== undefined && operator.$nin.includes(fieldValue)) return false;
     if (operator.$regex !== undefined) {
       const regex = new RegExp(operator.$regex, operator.$options || '');
-      return regex.test(fieldValue);
+      if (!regex.test(fieldValue)) return false;
     }
     if (operator.$exists !== undefined) {
-      return (fieldValue !== undefined) === operator.$exists;
+      if ((fieldValue !== undefined) !== operator.$exists) return false;
     }
     return true;
   }
@@ -230,10 +241,12 @@ class Query {
     const results = [];
     const pendingUpdates = this.table ? this.table.pendingUpdates : new Map();
     const pendingDeletes = this.table ? this.table.pendingDeletes : new Set();
-    
+    const seenIds = new Set();
+
     for (const id of candidateSet) {
       if (pendingDeletes.has(id)) continue;
-      
+      seenIds.add(id);
+
       let record = pendingUpdates.get(id) || this.data.get(id);
       if (!record && this.table) {
         record = await this.table.loadRecordById(id);
@@ -242,7 +255,15 @@ class Query {
         results.push(record);
       }
     }
-    
+
+    if (this.table && this.table.pendingWrites.length > 0) {
+      for (const record of this.table.pendingWrites) {
+        if (!pendingDeletes.has(record._id) && !seenIds.has(record._id)) {
+          results.push(record);
+        }
+      }
+    }
+
     return results;
   }
 
@@ -339,12 +360,13 @@ class Query {
   async streamResults() {
     const results = [];
     let processedCount = 0;
-    const maxToProcess = this.limitCount ? 
+    const maxToProcess = this.limitCount ?
       (this.limitCount + this.skipCount) * 2 : Infinity;
-    
+
     const pendingUpdates = this.table ? this.table.pendingUpdates : new Map();
     const pendingDeletes = this.table ? this.table.pendingDeletes : new Set();
-    
+    const seenIds = new Set();
+
     try {
       const fileStream = createReadStream(this.table.filePath);
       const rl = createInterface({
@@ -356,7 +378,8 @@ class Query {
         if (line.trim() && processedCount < maxToProcess) {
           try {
             const record = JSON.parse(line);
-            if (!pendingDeletes.has(record._id)) {
+            if (!seenIds.has(record._id) && !pendingDeletes.has(record._id) && !this.table.deletedIds.has(record._id)) {
+              seenIds.add(record._id);
               const actualRecord = pendingUpdates.get(record._id) || record;
               results.push(actualRecord);
               processedCount++;
@@ -367,7 +390,7 @@ class Query {
         }
         if (processedCount >= maxToProcess) break;
       }
-      
+
       rl.close();
       fileStream.destroy();
     } catch (error) {
@@ -375,15 +398,15 @@ class Query {
         throw error;
       }
     }
-    
+
     if (this.table && this.table.pendingWrites.length > 0) {
       for (const record of this.table.pendingWrites) {
-        if (!pendingDeletes.has(record._id)) {
+        if (!pendingDeletes.has(record._id) && !seenIds.has(record._id)) {
           results.push(record);
         }
       }
     }
-    
+
     return results;
   }
 
@@ -431,14 +454,14 @@ class Query {
     
     for (const [key, operation] of Object.entries(operations)) {
       if (operation.$sum) {
-        aggregated[key] = results.reduce((sum, r) => sum + (r[operation.$sum] || 0), 0);
+        aggregated[key] = results.reduce((sum, r) => sum + (r[operation.$sum] ?? 0), 0);
       } else if (operation.$avg) {
-        const sum = results.reduce((s, r) => s + (r[operation.$avg] || 0), 0);
+        const sum = results.reduce((s, r) => s + (r[operation.$avg] ?? 0), 0);
         aggregated[key] = results.length > 0 ? sum / results.length : 0;
       } else if (operation.$min) {
-        aggregated[key] = Math.min(...results.map(r => r[operation.$min] || Infinity));
+        aggregated[key] = Math.min(...results.map(r => r[operation.$min] ?? Infinity));
       } else if (operation.$max) {
-        aggregated[key] = Math.max(...results.map(r => r[operation.$max] || -Infinity));
+        aggregated[key] = Math.max(...results.map(r => r[operation.$max] ?? -Infinity));
       } else if (operation.$count) {
         aggregated[key] = results.length;
       }
