@@ -313,9 +313,9 @@ class Table extends EventEmitter {
     this.pendingWrites.push(fullRecord);
     
     if (this.pendingWrites.length >= this.batchSize) {
-      this.flushPendingWrites().catch(() => this.queueSave());
+      this.writeQueue = this.writeQueue.then(() => this.flushPendingWrites()).catch(() => this.queueSave());
     }
-    
+
     this.emit('insert', fullRecord);
     return fullRecord;
   }
@@ -323,17 +323,17 @@ class Table extends EventEmitter {
   insertMany(records) {
     const inserted = [];
     const timestamp = new Date().toISOString();
-    
+
     for (const record of records) {
       const id = record.id || record._id || uuidv4();
-      
+
       const fullRecord = {
         ...record,
         _id: id,
         _created: timestamp,
         _modified: timestamp
       };
-      
+
       this.cache.set(id, fullRecord);
       this.indexManager.updateIndices(id, null, fullRecord);
       this.deletedIds.delete(id);
@@ -341,9 +341,9 @@ class Table extends EventEmitter {
       inserted.push(fullRecord);
       this.pendingWrites.push(fullRecord);
     }
-    
+
     if (this.pendingWrites.length >= this.batchSize) {
-      this.flushPendingWrites().catch(() => this.queueSave());
+      this.writeQueue = this.writeQueue.then(() => this.flushPendingWrites()).catch(() => this.queueSave());
     }
     
     for (const record of inserted) {
@@ -490,20 +490,20 @@ class Table extends EventEmitter {
   async count(condition) {
     if (!condition) {
       const deletedCount = this.deletedIds.size + this.pendingDeletes.size;
-      if (this.data.size === this.metadata.recordCount || this.metadata.recordCount === 0) {
-        return this.data.size + this.pendingWrites.length - deletedCount;
-      }
-      return Math.max(0, this.metadata.recordCount + this.pendingWrites.length - deletedCount);
+      // data.size already includes records flushed from pendingWrites,
+      // so use max of data.size and metadata.recordCount to avoid double-counting
+      const baseCount = Math.max(this.data.size, this.metadata.recordCount);
+      return Math.max(0, baseCount + this.pendingWrites.length - deletedCount);
     }
     const query = new Query(this.data, this.indexManager);
     query.table = this;
     return await query.where(condition).count();
   }
 
-  createIndex(field) {
+  async createIndex(field) {
     this.indexManager.createIndex(field, this.data);
     if (this.data.size < this.metadata.recordCount) {
-      this.buildIndicesFromFile();
+      await this.buildIndicesFromFile();
     }
     this.queueSave();
     return this;
