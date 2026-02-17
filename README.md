@@ -1,64 +1,37 @@
 # AmoraDB
 
-A lightweight, file-based NoSQL database for Node.js applications with MongoDB-like query syntax and zero dependencies for core functionality.
+A lightweight, file-based NoSQL database for Node.js with MongoDB-like query syntax and zero external dependencies.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D%2014.0.0-brightgreen)](https://nodejs.org)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
 
-## 🎯 Why AmoraDB?
+## Overview
 
-AmoraDB bridges the gap between simple JSON file storage and complex database systems. Perfect for:
+AmoraDB is an embedded document database that stores data as JSONL (newline-delimited JSON) files on disk. It provides a chainable query builder, in-memory indexing, an LRU cache, and an event system — all with no external dependencies. Everything runs off Node.js built-ins (`fs`, `path`, `crypto`, `events`, `readline`).
 
-- **Rapid Prototyping**: Start building immediately without database setup
-- **Small to Medium Applications**: Handle thousands of records efficiently  
-- **Electron/Desktop Apps**: Embedded database with no external dependencies
-- **Microservices**: Lightweight data persistence without infrastructure overhead
-- **Educational Projects**: Learn database concepts with readable JSON storage
-- **Offline-First Applications**: Full functionality without network connectivity
+It works well for Electron/desktop apps, microservices, CLI tools, offline-first applications, and any Node.js project that needs persistent document storage without running a separate database server.
 
-## ✨ Key Features
-
-- 🚀 **Zero Configuration**: No server setup, no connection strings
-- 📁 **Human-Readable Storage**: Data stored as formatted JSON files
-- 🔍 **MongoDB-like Queries**: Familiar syntax with operators like `$gte`, `$regex`, `$in`
-- ⚡ **Indexed Queries**: Create indices for lightning-fast lookups
-- 🔗 **Chainable API**: Build complex queries with intuitive method chaining
-- 💾 **ACID-like Guarantees**: Atomic writes with transaction support
-- 🎯 **In-Memory Caching**: LRU cache for optimal performance
-- 📊 **Aggregation Pipeline**: Built-in sum, average, min, max operations
-- 🔄 **Real-time Events**: EventEmitter for reactive applications
-- 🛡️ **Type Safety**: Full TypeScript support (coming soon)
-
-## 📦 Installation
+## Installation
 
 ```bash
 npm install amoradb
 ```
 
-Or with yarn:
-```bash
-yarn add amoradb
-```
-
-## 🚀 Quick Start
+## Quick Start
 
 ```javascript
 const AmoraDB = require('amoradb');
 
-// Initialize database
 const db = new AmoraDB('myapp');
 await db.init();
 
-// Get a table (collection)
 const users = db.table('users');
 
-// Insert data
+// Insert a record (synchronous, writes are batched to disk)
 const user = users.insert({
   name: 'Sarah Connor',
   email: 'sarah@resistance.com',
-  age: 29,
-  role: 'leader'
+  age: 29
 });
 
 // Query with operators
@@ -68,64 +41,60 @@ const results = await users
   .limit(10)
   .execute();
 
-// Update records
+// Update
 await users.update(user._id, { status: 'active' });
 
-// Close when done
+// Close (flushes pending writes to disk)
 await db.close();
 ```
 
-## 📖 Core Concepts
+## How Data Is Stored
 
-### Database Structure
 ```
 data/
-└── myapp/                    # Database directory
-    ├── _metadata.json        # Database metadata
-    ├── users.jsonl           # Users table
-    ├── orders.jsonl          # Orders table
-    └── products.jsonl        # Products table
+└── myapp/
+    ├── _metadata.json       # Database metadata and index definitions
+    ├── users.jsonl           # One JSON object per line
+    ├── users.meta.json       # Table-level metadata (record count, indices)
+    ├── orders.jsonl
+    └── orders.meta.json
 ```
 
-### Tables (Collections)
-Tables are schema-less document stores that hold related data. Each table is stored as a separate JSON file.
-
-```javascript
-const users = db.table('users');     // Get or create table
-const products = db.table('products');
-```
-
-### Documents
-Documents are JavaScript objects with automatic metadata:
+Each record is a JSON object stored on its own line. Every record gets automatic metadata fields:
 
 ```javascript
 {
-  _id: "uuid-here",           // Auto-generated unique ID
-  _created: "2024-01-01T00:00:00Z",  // Creation timestamp
-  _modified: "2024-01-01T00:00:00Z", // Last modified timestamp
-  ...yourData                 // Your custom fields
+  _id: "550e8400-e29b-41d4-a716-446655440000",  // UUID v4 (auto-generated, or supply your own)
+  _created: "2024-01-01T00:00:00.000Z",
+  _modified: "2024-01-01T00:00:00.000Z",
+  // ...your fields
 }
 ```
 
-## 🔍 Query Language
+Inserts are synchronous in-memory and batched to disk asynchronously. Updates and deletes are tracked in memory and compacted into the file periodically (when mutations exceed 30% of total records) or on `flush()`/`close()`.
+
+## Query Language
 
 ### Basic Queries
 
 ```javascript
-// Find all
-users.all().execute();
+// All records
+await users.all().execute();
 
 // Find with conditions
-users.find({ status: 'active' }).execute();
+await users.find({ status: 'active' }).execute();
 
 // Find one
 await users.findOne({ email: 'user@example.com' });
 
 // Find by ID
 await users.findById('uuid-here');
+
+// Function predicates work too
+await users.find(record => record.age > 28).execute();
 ```
 
-### Query Operators
+### Operators
 
 | Operator | Description | Example |
 |----------|-------------|---------|
@@ -135,35 +104,39 @@ await users.findById('uuid-here');
 | `$gte` | Greater than or equal | `{ score: { $gte: 90 } }` |
 | `$lt` | Less than | `{ price: { $lt: 100 } }` |
 | `$lte` | Less than or equal | `{ quantity: { $lte: 5 } }` |
-| `$in` | In array | `{ role: { $in: ['admin', 'mod'] } }` |
-| `$nin` | Not in array | `{ status: { $nin: ['banned', 'deleted'] } }` |
-| `$regex` | Pattern match | `{ email: { $regex: '@gmail.com' } }` |
+| `$in` | Value in array | `{ role: { $in: ['admin', 'mod'] } }` |
+| `$nin` | Value not in array | `{ status: { $nin: ['banned', 'deleted'] } }` |
+| `$regex` | Pattern match | `{ email: { $regex: '@gmail\\.com' } }` |
 | `$exists` | Field exists | `{ phone: { $exists: true } }` |
 
-### Complex Queries
+Multiple operators on the same field are ANDed together: `{ price: { $gt: 10, $lt: 50 } }`.
+
+The `$regex` operator supports an optional `$options` key for flags (e.g., `{ name: { $regex: 'john', $options: 'i' } }` for case-insensitive matching).
+
+### Chaining
 
 ```javascript
-// Chained conditions
-const premiumUsers = await users
+const results = await users
   .find({ age: { $gte: 18 } })
   .and({ subscription: 'premium' })
   .or({ role: 'vip' })
   .sort('joinDate', 'desc')
   .skip(0)
   .limit(20)
-  .execute();
-
-// Select specific fields
-const emails = await users
-  .find({ newsletter: true })
   .select(['email', 'name'])
   .execute();
-
-// Distinct values
-const uniqueCities = users.all().distinct('address.city');
 ```
 
-## 📊 Aggregation
+- `where()` / `and()` — add an AND condition
+- `or()` — add an OR condition
+- `sort(field, 'asc' | 'desc')` — sort results
+- `limit(n)` / `skip(n)` — pagination
+- `select(fields[])` — project specific fields
+- `distinct(field)` — return unique values (supports dot-notation like `'address.city'`)
+- `first()` — return just the first match
+- `count()` — return the count of matches
+
+### Aggregation
 
 ```javascript
 const stats = await users
@@ -175,269 +148,155 @@ const stats = await users
     minAge: { $min: 'age' },
     maxAge: { $max: 'age' }
   });
-
-console.log(stats);
-// { totalUsers: 150, totalAge: 4500, avgAge: 30, minAge: 18, maxAge: 65 }
 ```
 
-## ⚡ Performance Optimization
+## Indexing
 
-### Indexing
-Create indices for frequently queried fields:
+Create indices on frequently queried fields to speed up lookups. The index type is auto-detected: numeric and date fields get a sorted index (binary search for range queries), while string/categorical fields get a hash index (fast equality and `$in` lookups).
 
 ```javascript
-users.createIndex('email');     // Fast email lookups
-users.createIndex('username');  // Fast username queries
-users.createIndex('created_at'); // Fast date sorting
+await users.createIndex('email');
+await users.createIndex('age');
+
+// Remove an index
+users.dropIndex('email');
 ```
 
-### Caching
-Built-in LRU cache with configurable size:
+Indices are rebuilt from the data file on startup. Index definitions are persisted in the metadata files so they survive restarts.
+
+The query engine automatically uses available indices when evaluating conditions, and falls back to a full scan for non-indexed fields.
+
+## Caching
+
+AmoraDB uses an in-memory LRU cache. When a table's total record count fits within the cache size, all records are held in memory. For larger tables, records are loaded on demand and the least recently used entries are evicted when the cache is full.
 
 ```javascript
 const db = new AmoraDB('myapp', {
-  cacheSize: 5000  // Cache up to 5000 records in memory
+  cacheSize: 5000  // default is 1000
 });
 
-// Monitor cache performance
+// Check cache performance
 const stats = users.cache.getStats();
-console.log(`Cache hit rate: ${stats.hitRate * 100}%`);
+// { size, maxSize, hits, misses, hitRate }
 ```
 
-## 🔄 Real-time Events
+For tables that exceed the cache size, queries stream the JSONL file line-by-line rather than loading everything into memory.
+
+## Events
+
+Both the database and individual tables emit events via Node.js `EventEmitter`.
 
 ```javascript
-users.on('insert', (record) => {
-  console.log('New user:', record);
-});
+// Table events
+users.on('insert', (record) => { /* ... */ });
+users.on('update', (record) => { /* ... */ });
+users.on('delete', (record) => { /* ... */ });
+users.on('save', (tableName) => { /* ... */ });
+users.on('truncate', () => { /* ... */ });
+users.on('drop', () => { /* ... */ });
 
-users.on('update', (record) => {
-  console.log('Updated user:', record);
-});
-
-users.on('delete', (record) => {
-  console.log('Deleted user:', record);
-});
+// Database events
+db.on('ready', (db) => { /* ... */ });
+db.on('error', (err) => { /* ... */ });
+db.on('close', () => { /* ... */ });
 ```
 
-## 🛠️ API Reference
+## API Reference
 
-### Database Methods
+### Database
 
 | Method | Description |
 |--------|-------------|
-| `new AmoraDB(name, options)` | Create database instance |
-| `await db.init()` | Initialize database |
-| `db.table(name)` | Get or create table |
-| `await db.dropTable(name)` | Delete table |
-| `await db.listTables()` | List all tables |
-| `await db.backup(path)` | Backup database |
-| `await db.close()` | Close database |
+| `new AmoraDB(name, options?)` | Create a database instance |
+| `await db.init()` | Initialize the database, load existing tables |
+| `db.table(name)` | Get or create a table |
+| `await db.dropTable(name)` | Delete a table and its files |
+| `await db.listTables()` | List all table names |
+| `await db.backup(path?)` | Copy all files to a backup directory |
+| `await db.close()` | Flush all pending writes and close |
+| `await db.drop()` | Close and delete the entire database directory |
+| `await db.getStats()` | Get record counts and cache stats per table |
+| `await db.optimize()` | Flush writes and rebuild all indices |
 
-### Table Methods
-
-| Method | Description |
-|--------|-------------|
-| `insert(record)` | Insert single record |
-| `insertMany(records)` | Insert multiple records |
-| `find(query)` | Query builder |
-| `findOne(query)` | Find first match |
-| `findById(id)` | Find by ID |
-| `update(id, changes)` | Update by ID |
-| `updateMany(query, changes)` | Update multiple |
-| `delete(id)` | Delete by ID |
-| `deleteMany(query)` | Delete multiple |
-| `count(query)` | Count matching records |
-| `createIndex(field)` | Create index |
-| `all()` | Get all records |
-
-### Query Methods
+### Table
 
 | Method | Description |
 |--------|-------------|
-| `where(condition)` | Add condition |
-| `and(condition)` | AND condition |
-| `or(condition)` | OR condition |
-| `sort(field, order)` | Sort results |
-| `limit(n)` | Limit results |
-| `skip(n)` | Skip records |
-| `select(fields)` | Select fields |
-| `distinct(field)` | Unique values |
-| `aggregate(ops)` | Aggregation |
-| `execute()` | Run query |
+| `insert(record)` | Insert a single record (sync) |
+| `insertMany(records)` | Insert multiple records (sync) |
+| `find(query)` | Returns a chainable query builder |
+| `findOne(query)` | Find first matching record |
+| `findById(id)` | Find record by `_id` |
+| `all()` | Query builder for all records |
+| `await update(id, changes)` | Update a record by ID |
+| `await updateMany(query, changes)` | Update all matching records |
+| `await delete(id)` | Delete a record by ID |
+| `await deleteMany(query)` | Delete all matching records |
+| `await count(query?)` | Count records (optionally filtered) |
+| `await createIndex(field)` | Create an index on a field |
+| `dropIndex(field)` | Remove an index |
+| `await flush()` | Force flush pending writes to disk |
+| `await truncate()` | Clear all records from the table |
+| `await drop()` | Delete the table and its files |
 
-## 🎯 Use Cases
+### Query Builder
 
-### 1. User Management System
-```javascript
-const users = db.table('users');
-users.createIndex('email');
+| Method | Description |
+|--------|-------------|
+| `where(condition)` | Add a filter condition |
+| `and(condition)` | AND another condition |
+| `or(condition)` | OR another condition |
+| `sort(field, order)` | Sort by field (`'asc'` or `'desc'`) |
+| `limit(n)` | Limit number of results |
+| `skip(n)` | Skip n results |
+| `select(fields)` | Project specific fields |
+| `await execute()` | Run the query, return results array |
+| `await first()` | Return first match |
+| `await count()` | Return count of matches |
+| `await distinct(field)` | Return unique values |
+| `await aggregate(ops)` | Run aggregation operations |
 
-// Registration
-const newUser = users.insert({
-  email: 'user@example.com',
-  password: hashedPassword,
-  profile: {
-    name: 'John Doe',
-    avatar: 'avatar.jpg'
-  }
-});
-
-// Authentication
-const user = users.findOne({ 
-  email: 'user@example.com',
-  active: true 
-});
-
-// Update last login
-users.update(user._id, { 
-  lastLogin: new Date().toISOString() 
-});
-```
-
-### 2. Shopping Cart
-```javascript
-const carts = db.table('carts');
-
-// Add to cart
-carts.insert({
-  userId: 'user-123',
-  items: [
-    { productId: 'prod-1', quantity: 2, price: 29.99 },
-    { productId: 'prod-2', quantity: 1, price: 49.99 }
-  ],
-  total: 109.97
-});
-
-// Get user's cart
-const cart = carts.findOne({ userId: 'user-123' });
-
-// Calculate totals
-const stats = carts.aggregate({
-  totalRevenue: { $sum: 'total' },
-  avgCartValue: { $avg: 'total' },
-  cartCount: { $count: true }
-});
-```
-
-### 3. Activity Logger
-```javascript
-const logs = db.table('activity_logs');
-logs.createIndex('timestamp');
-logs.createIndex('userId');
-
-// Log activity
-logs.insert({
-  userId: 'user-123',
-  action: 'LOGIN',
-  timestamp: Date.now(),
-  metadata: { ip: '192.168.1.1', device: 'mobile' }
-});
-
-// Query recent activities
-const recentLogs = await logs
-  .find({ 
-    timestamp: { $gte: Date.now() - 86400000 } // Last 24h
-  })
-  .sort('timestamp', 'desc')
-  .limit(100)
-  .execute();
-```
-
-## ⚙️ Configuration Options
+## Configuration
 
 ```javascript
 const db = new AmoraDB('myapp', {
-  dataPath: './custom/path',    // Custom data directory
-  cacheSize: 2000,              // LRU cache size
-  autoSave: true,               // Auto-save on changes
-  compression: false,           // Compression (future feature)
-  indexAutoCreate: true         // Auto-create indices
+  dataPath: './custom/path',  // where to store database files (default: './data')
+  cacheSize: 2000,            // LRU cache capacity (default: 1000)
+  autoSave: true              // auto-flush writes on a debounced timer (default: true)
 });
 ```
 
-## 🚀 Performance Benchmarks
+## Limitations
 
-=== PERFORMANCE BENCHMARK RESULTS ===
+- **Single process**: Designed for use within a single Node.js process. Multi-process file locking is on the roadmap.
+- **No transactions**: Writes use atomic file rename for durability, but there is no rollback or multi-operation transaction mechanism.
 
-| Operation | Records | Time (ms) | Ops/sec | Memory (MB) |
-|-----------|---------|-----------|---------|-------------|
-| Single Insert (1,000 records) |   1,000 |        16 |    62,663 |        3.84 |
-| Batch Insert (100,000 records) | 100,000 |     1,672 |    59,801 |      378.46 |
-| Simple Indexed Query (category) |  10,001 |         4 | 2,360,443 |        1.68 |
-| Complex Indexed Query (price range) |  10,057 |        11 |   900,926 |        8.93 |
-| Non-indexed Query (name pattern) |  11,111 |        36 |   312,514 |       -2.88 |
-| Sorted Query with Limit (top 1000 by price) |   1,000 |        13 |    76,240 |       -11.2 |
-| Aggregation (price statistics) |       1 |        22 |        45 |        6.68 |
-| Count Query (all active products) |  25,001 |         2 | 11,957,429 |        3.36 |
-| Distinct Query (unique categories) |      10 |        27 |       371 |       -2.41 |
-| Single Updates (10,000 records) |  10,000 |     1,387 |     7,208 |        2.02 |
-| Batch Update (50,000 records) |  10,001 |     1,222 |     8,185 |        3.71 |
-| Single Deletes (5,000 records) |   5,000 |       318 |    15,705 |       -0.33 |
-| Batch Delete (remaining archived) |  20,000 |     1,044 |    19,159 |       -0.86 |
-| Memory Efficient Insert (50,000 records, small cache) |  50,000 |       518 |    96,577 |     -151.46 |
-| Streaming Query (large dataset) |     100 |        22 |     4,579 |        3.08 |
+## Roadmap
 
-=== SUMMARY ===
-Total Records Processed: 253,282
-Total Time: 6.31s
-Average Performance: 40,114 ops/sec
-
-*Benchmarks on MacBook Pro M1, Node.js 18*
-
-## 🔒 Limitations
-
-- **File Size**: Best for databases under 100MB
-- **Concurrency**: Single-process only (no multi-process support)
-- **Transactions**: Basic transaction support, not full ACID
-- **Scalability**: Not suitable for high-traffic production systems
-
-## 🗺️ Roadmap
-
-- [ ] TypeScript definitions (In Progress)
-- [x] Better Memory Optimization
-- [ ] Bun Support
+- [ ] TypeScript definitions (in progress)
 - [ ] Multi-process support with file locking
 - [ ] Data compression
 - [ ] Encrypted storage
 - [ ] Browser support (IndexedDB backend)
 - [ ] Replication and sync
-- [ ] Query optimization engine
-- [ ] Migrations system
-- [ ] CLI tools
+- [ ] Query optimizer improvements
+- [ ] Migration system
 
-## 🤝 Contributing
+## Contributing
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details.
+Contributions are welcome.
 
 ```bash
-# Clone repository
 git clone https://github.com/samuelail/amoradb.git
-
-# Install dependencies
+cd amoradb
 npm install
-
-# Run tests
 npm test
-
-# Build
-npm run build
 ```
 
-## 📄 License
+## License
 
-MIT © Samuel Ailemen
-
-## 🙏 Acknowledgments
-
-Inspired by:
-- [LowDB](https://github.com/typicode/lowdb) - Simple JSON database
-- [NeDB](https://github.com/louischatriot/nedb) - Embedded persistent database
-- [MongoDB](https://mongodb.com) - Query syntax inspiration
-
-## Support
-- 🐛 Issues: [GitHub Issues](https://github.com/samuelail/amoradb/issues)
+MIT - Samuel Ailemen
 
 ---
 
-**Built with ❤️ for developers**
+[GitHub Issues](https://github.com/samuelail/amoradb/issues)
